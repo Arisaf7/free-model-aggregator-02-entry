@@ -1,24 +1,11 @@
 // The brief's two documents, the free model list, and the catalog.
 //
-// A trial's brief (the path in MAKEFUN_PROMPT_FILE) is prose with two JSON documents in it, and the
-// prose around them does not matter: this file finds each by its `schema` member, under this contest's
-// prefix (`free-model-aggregator-02/`).
+// A trial's brief (the path in MAKEFUN_PROMPT_FILE) is prose with two JSON documents in it. This
+// file finds each document by its `schema` member under this contest's prefix
+// (`free-model-aggregator-02/`): the free model list and the six prompts. The prose around them is
+// never parsed.
 //
-//   - the free model list (`free-model-aggregator-02/models/v1`): one row a model, keyed by the id the
-//     gateway routes (`openrouter/<vendor>/<model>:free`), with the model's public rating in
-//     milli-points, what it can do (tools, vision, JSON mode, context length) and its free flag. Only a
-//     free model may serve a prompt; this baseline never routes a paid one.
-//   - the six prompts (`free-model-aggregator-02/prompts/v1`): the prompts the house's client will
-//     send, in order, each with its id, its api (`openai` or `anthropic`), whether it streams, its
-//     weight (1 or 2) and the requirements a model must meet to serve it. The client sends the bodies;
-//     this baseline routes each arrival by its row, which is why the prompt list is read before the
-//     first request.
-//
-// A brief may spell the model list `models` or `ratings` and the prompts `prompts` or `manifest` (the
-// sibling -01 contest's names), and one document may carry both; a document is found by the arrays it
-// carries, never by a name alone. The brief's own prose is never parsed.
-//
-// Everything here is deterministic: no clock and no randomness, so `node main.ts --list` and the
+// Everything here is deterministic: no clock, no randomness, so `node main.ts --list` and the
 // register body build the same document, byte for byte, on a live pass and on its replay.
 
 import { readFileSync } from 'node:fs';
@@ -29,9 +16,9 @@ export const PROMPTS_SCHEMA = 'free-model-aggregator-02/prompts/v1';
 /** Every schema this contest's brief writes names this prefix; the brief's JSON is found by it. */
 const SCHEMA_PREFIX = 'free-model-aggregator-02/';
 
-/** The public base URL of the provider the free models belong to: the endpoint the gateway reaches for them. */
+/** The public base URL of the provider the free models belong to: the endpoint the gateway reaches. */
 export const OPENROUTER_PUBLIC_BASE = 'https://openrouter.ai/api/v1';
-/** The environment variable an entrant's OpenRouter key is pushed under (an entry secret, kept out of the sandbox). */
+/** The environment variable an entrant's OpenRouter key is pushed under. */
 export const OPENROUTER_KEY_ENV = 'OPENROUTER_API_KEY';
 
 export type Json = Record<string, unknown>;
@@ -69,7 +56,7 @@ export interface PromptRow {
   requires: Requirement;
 }
 
-/** The brief as this baseline reads it. `error` is set when a document could not be read. */
+/** The brief as this entry reads it. `error` is set when a document could not be read. */
 export interface Brief {
   models: ModelRow[];
   prompts: PromptRow[];
@@ -166,10 +153,9 @@ function arrayDocument(docs: readonly Json[], keys: readonly string[]): { doc: J
 }
 
 /**
- * One model row. The id is the row's `id`, or its `model` under the provider that names it: a row that
- * gives the bare OpenRouter id (`vendor/model:free`) and names `openrouter` is routed as the gateway
- * spells it (`openrouter/vendor/model:free`). The brief lists free models, so a row is free unless it
- * says `free: false`; a paid row is never routed.
+ * One model row. The id is the row's `id`, or its `model` under the provider that names it: a row
+ * that gives the bare OpenRouter id (`vendor/model:free`) and names `openrouter` is routed as the
+ * gateway spells it (`openrouter/vendor/model:free`). A row is free unless it says `free: false`.
  */
 function modelOf(v: unknown): ModelRow | null {
   if (!isRecord(v)) return null;
@@ -265,12 +251,12 @@ export function meetsRequirements(requires: Requirement, caps: Capabilities): bo
 /**
  * The catalog the brief's free model list makes: one provider, the models it serves.
  *
- * The base_url is the provider's public endpoint, never the gateway's trial-local address: the gateway's
- * origin differs between a live pass and its replay, and the catalog is part of the state export a
- * replay must reproduce byte for byte.
+ * The base_url is the provider's public endpoint, never the gateway's trial-local address: the
+ * gateway's origin differs between a live pass and its replay, and the catalog is part of the state
+ * export a replay must reproduce byte for byte.
  *
- * This baseline lists every free model in the brief — exactly the fourteen dialable ids the catalog
- * column scores — so keep it that way: register this set and keep GET /v1/models (both auth headers)
+ * This lists every free model in the brief — exactly the fourteen dialable ids the catalog column
+ * scores — so keep it that way: register this set and keep GET /v1/models (both auth headers)
  * exactly that set, since listing fewer loses the column as surely as listing more.
  */
 export function buildCatalog(brief: Brief): CatalogReport {
