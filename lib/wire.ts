@@ -1,17 +1,9 @@
 // The client wires, the one upstream wire, and the model field.
 //
-// The trial's client calls the entry as an OpenAI service (POST /v1/chat/completions) or an Anthropic
-// one (POST /v1/messages), with a JSON body or with server-sent events. The entry dials the grader's
-// gateway, an OpenAI-compatible endpoint, so every prompt goes upstream as a Chat Completions request
-// and the Anthropic path is translated both ways:
-//
-//   - the OpenAI path passes the client's body (with the dialled model's id) to the gateway and relays
-//     the gateway's JSON or SSE answer, with every `model` field set to the id this entry dialled;
-//   - the Anthropic path rewrites the request to Chat Completions (system prompt, image blocks, tool
-//     definitions, tool results and tool choice included) and rewrites the gateway's answer into a
-//     Messages object, or into the message_start / content_block_start / content_block_delta /
-//     content_block_stop / message_delta / message_stop event order, with the stop reason and the usage
-//     translated. Tool calls become tool_use blocks and input_json_delta events.
+// The trial's client calls the entry as an OpenAI service (POST /v1/chat/completions) or an
+// Anthropic one (POST /v1/messages), with a JSON body or with server-sent events. The entry dials
+// the grader's gateway, an OpenAI-compatible endpoint, so every prompt goes upstream as a Chat
+// Completions request and the Anthropic path is translated both ways.
 //
 // THE MODEL FIELD
 //   The house records every gateway call and scores the model that really answered, so a response's
@@ -20,10 +12,17 @@
 //   every streamed chunk. They never make a model up: the id came from the brief and went to the
 //   gateway in the request's `model`.
 //
-// Everything here is a pure function of its arguments, except the stream relays: no clock and no
-// randomness, so the same body and the same gateway answer give the same bytes on a replay. The two
-// model listings use fixed timestamps for the same reason: a `created` that moved between runs would be
-// a nondeterministic document.
+// STREAMING
+//   Upstream SSE is buffered and parsed once into one UpstreamAnswer (text, tool calls, the first
+//   finish reason, usage), then re-emitted in canonical form. That is what makes the stream
+//   well-formed no matter what the provider sent: exactly one finish chunk, the usage on a chunk of
+//   its own, and [DONE] last on the OpenAI wire; message_start / content blocks / message_delta /
+//   message_stop in order on the Anthropic wire.
+//
+// Everything here is a pure function of its arguments: no clock and no randomness, so the same body
+// and the same gateway answer give the same bytes on a replay. The two model listings use fixed
+// timestamps for the same reason: a `created` that moved between runs would be a nondeterministic
+// document.
 
 import { isRecord, type Json } from './providers.ts';
 
@@ -38,6 +37,28 @@ export interface ServedModel {
 const FIXED_OPENAI_CREATED = 1767225600;
 /** A fixed instant for every listed model's `created_at`: nothing in the reply reads the clock. */
 const FIXED_ANTHROPIC_CREATED_AT = '2026-01-01T00:00:00Z';
+
+/** One tool call the provider made, arguments accumulated across streamed deltas. */
+export interface ToolCall {
+  id: string;
+  name: string;
+  /** The arguments as a JSON string, exactly as the provider sent them (possibly in pieces). */
+  arguments: string;
+}
+
+/** One upstream Chat Completions answer, JSON or streamed, parsed into its parts. */
+export interface UpstreamAnswer {
+  /** The assistant's text, in order, with streamed deltas joined. */
+  text: string;
+  /** The tool calls, in the order their first delta arrived. */
+  toolCalls: ToolCall[];
+  /** The first finish_reason the provider sent, or null when it sent none. */
+  finishReason: string | null;
+  /** The usage the provider reported, or null when it reported none. */
+  usage: { prompt_tokens: number; completion_tokens: number } | null;
+  /** The model spelling the provider's own answer carried (bare, without the gateway prefix). */
+  providerModel: string;
+}
 
 /** GET /v1/models on an OpenAI-shaped request: the models this entry serves, in OpenAI's list shape. */
 export function openAIModelList(models: readonly ServedModel[]): Json {
@@ -108,6 +129,10 @@ function argumentsOf(value: unknown): Json {
     }
   }
   return {};
+}
+
+function numberOrZero(value: unknown): number {
+  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
 }
 
 /** OpenAI's finish_reason as Anthropic's stop_reason. */
@@ -210,45 +235,62 @@ export function anthropicToOpenAI(body: Json, model: string): Json {
   return out;
 }
 
-function numberOrZero(value: unknown): number {
-  return typeof value === 'number' && Number.isFinite(value) ? value : 0;
-}
-
 /** A Chat Completions answer as an Anthropic Messages object. `model` is the id the entry dialled. */
-export function openAIToAnthropic(body: Json, model: string): Json {
-  const choices = Array.isArray(body.choices) ? body.choices : [];
-  const choice = isRecord(choices[0]) ? choices[0] : {};
-  const message = isRecord(choice.message) ? choice.message : {};
+export function openAIToAnthropic(answer: UpstreamAnswer, model: string): Json {
   const content: Json[] = [];
-  const text = typeof message.content === 'string' ? message.content : textOf(message.content);
-  if (text !== '') content.push({ type: 'text', text });
-  const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
-  for (const call of calls) {
-    if (!isRecord(call) || !isRecord(call.function)) continue;
-    content.push({
-      type: 'tool_use',
-      id: typeof call.id === 'string' ? call.id : 'toolu_unknown',
-      name: typeof call.function.name === 'string' ? call.function.name : '',
-      input: argumentsOf(call.function.arguments),
-    });
+  if (answer.text !== '') content.push({ type: 'text', text: answer.text });
+  for (const call of answer.toolCalls) {
+    content.push({ type: 'tool_use', id: call.id !== '' ? call.id : 'toolu_unknown', name: call.name, input: argumentsOf(call.arguments) });
   }
   if (content.length === 0) content.push({ type: 'text', text: '' });
-  const usage = isRecord(body.usage) ? body.usage : {};
   return {
-    id: `msg_${typeof body.id === 'string' ? body.id : 'aggregate'}`,
+    id: 'msg_aggregate',
     type: 'message',
     role: 'assistant',
     model,
     content,
-    stop_reason: stopReasonOf(choice.finish_reason),
+    stop_reason: stopReasonOf(answer.finishReason),
     stop_sequence: null,
-    usage: { input_tokens: numberOrZero(usage.prompt_tokens), output_tokens: numberOrZero(usage.completion_tokens) },
+    usage: {
+      input_tokens: answer.usage === null ? 0 : answer.usage.prompt_tokens,
+      output_tokens: answer.usage === null ? 0 : answer.usage.completion_tokens,
+    },
   };
 }
 
 /** A Chat Completions answer with `model` set to the id the entry dialled: the one truthful claim. */
-export function openAIJsonWithModel(body: Json, model: string): Json {
-  return { ...body, model };
+export function openAIJsonWithModel(answer: UpstreamAnswer, model: string): Json {
+  const body: Json = {
+    id: 'chatcmpl-aggregate',
+    object: 'chat.completion',
+    created: FIXED_OPENAI_CREATED,
+    model,
+    choices: [
+      {
+        index: 0,
+        message: {
+          role: 'assistant',
+          content: answer.text,
+          ...(answer.toolCalls.length > 0
+            ? {
+                tool_calls: answer.toolCalls.map((call) => ({
+                  id: call.id !== '' ? call.id : 'call_unknown',
+                  type: 'function',
+                  function: { name: call.name, arguments: call.arguments },
+                })),
+              }
+            : {}),
+        },
+        finish_reason: typeof answer.finishReason === 'string' ? answer.finishReason : 'stop',
+      },
+    ],
+    usage: {
+      prompt_tokens: answer.usage === null ? 0 : answer.usage.prompt_tokens,
+      completion_tokens: answer.usage === null ? 0 : answer.usage.completion_tokens,
+      total_tokens: answer.usage === null ? 0 : answer.usage.prompt_tokens + answer.usage.completion_tokens,
+    },
+  };
+  return body;
 }
 
 /** One server-sent event: `event: <name>` when named, then the JSON data line, then the blank line. */
@@ -256,209 +298,212 @@ export function sseEvent(event: string | null, data: unknown): string {
   return `${event === null ? '' : `event: ${event}\n`}data: ${JSON.stringify(data)}\n\n`;
 }
 
-/**
- * One SSE frame with every data payload's `model` set to `model`, and its blank line kept: comments,
- * `event:` lines and payloads that are not JSON objects pass through untouched. Chat Completions names
- * the model on its chunks; the client sees the id the entry dialled, never the provider's spelling.
- */
-function frameWithModel(frame: string, model: string): string {
-  const lines = frame.split('\n').map((line) => {
-    const trimmed = line.trim();
-    if (!trimmed.startsWith('data:')) return line;
-    const payload = trimmed.slice(5).trim();
-    if (payload === '' || payload === '[DONE]') return line;
-    try {
-      const chunk: unknown = JSON.parse(payload);
-      if (isRecord(chunk)) return `data: ${JSON.stringify({ ...chunk, model })}`;
-    } catch {
-      // Not JSON: relay the line as it came.
-    }
-    return line;
-  });
-  return `${lines.join('\n')}\n\n`;
-}
-
-/**
- * A Chat Completions SSE stream as it came, frame by frame, every data payload's `model` the id the
- * entry dialled. Frames are split on the blank line that ends them, as the SSE grammar does; a frame cut
- * across reads is held until its end arrives, and a body that ends without one is relayed as it is.
- */
-export async function* openAIStreamWithModel(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
-  const reader = upstream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-      let at = buffer.indexOf('\n\n');
-      while (at !== -1) {
-        const frame = buffer.slice(0, at);
-        buffer = buffer.slice(at + 2);
-        yield frameWithModel(frame, model);
-        at = buffer.indexOf('\n\n');
-      }
-    }
-    buffer += decoder.decode();
-    if (buffer.trim() !== '') yield frameWithModel(buffer, model);
-  } finally {
-    reader.releaseLock();
-  }
-}
-
-/**
- * A Chat Completions SSE stream as the Anthropic event sequence: message_start on the first chunk,
- * content_block_start/delta/stop per text block or tool call, then message_delta with the stop reason and
- * usage, then message_stop. `model` is the id the entry dialled, named back to the client.
- */
-export async function* anthropicEventsFromOpenAI(upstream: ReadableStream<Uint8Array>, model: string): AsyncGenerator<string> {
-  const reader = upstream.getReader();
-  const decoder = new TextDecoder();
-  let buffer = '';
-  let started = false;
-  let finished = false;
-  /** The stop reason a finish_reason named, held until the stream's usage chunk has arrived. */
-  let pendingStop: string | null = null;
-  let textIndex = -1;
-  let nextIndex = 0;
-  const toolIndexes = new Map<number, number>();
-  let inputTokens = 0;
-  let outputTokens = 0;
-
-  const startEvents = (): string[] => {
-    if (started) return [];
-    started = true;
-    return [
-      sseEvent('message_start', {
-        type: 'message_start',
-        message: {
-          id: 'msg_stream',
-          type: 'message',
-          role: 'assistant',
-          model,
-          content: [],
-          stop_reason: null,
-          stop_sequence: null,
-          usage: { input_tokens: inputTokens, output_tokens: 0 },
-        },
-      }),
-    ];
-  };
-  const closeEvents = (): string[] => {
-    const out: string[] = [];
-    if (textIndex !== -1) {
-      out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
-      textIndex = -1;
-    }
-    for (const index of [...toolIndexes.values()].sort((a, b) => a - b)) out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index }));
-    toolIndexes.clear();
-    return out;
-  };
-  const finishEvents = (stopReason: string): string[] => {
-    if (finished) return [];
-    finished = true;
-    return [
-      ...closeEvents(),
-      sseEvent('message_delta', { type: 'message_delta', delta: { stop_reason: stopReason, stop_sequence: null }, usage: { output_tokens: outputTokens } }),
-      sseEvent('message_stop', { type: 'message_stop' }),
-    ];
-  };
-
-  /** One SSE frame's lines as Anthropic events, mutating the stream's state. */
-  const eventsOfFrame = (frame: string): string[] => {
-    const out: string[] = [];
+/** Split a raw SSE body into its data payloads, in order; `[DONE]` is returned as the string itself. */
+function ssePayloads(raw: string): (Json | '[DONE]')[] {
+  const out: (Json | '[DONE]')[] = [];
+  const normalized = raw.replace(/\r\n/g, '\n');
+  for (const frame of normalized.split('\n\n')) {
     for (const line of frame.split('\n')) {
       const trimmed = line.trim();
       if (!trimmed.startsWith('data:')) continue;
       const payload = trimmed.slice(5).trim();
+      if (payload === '') continue;
       if (payload === '[DONE]') {
-        out.push(...startEvents(), ...finishEvents(pendingStop ?? 'end_turn'));
+        out.push('[DONE]');
         continue;
       }
-      let chunk: unknown;
       try {
-        chunk = JSON.parse(payload);
+        const parsed: unknown = JSON.parse(payload);
+        if (isRecord(parsed)) out.push(parsed);
       } catch {
-        continue;
+        // Not JSON: not a chunk this parser can use.
       }
-      if (!isRecord(chunk)) continue;
-      if (isRecord(chunk.usage)) {
-        inputTokens = numberOrZero(chunk.usage.prompt_tokens);
-        outputTokens = numberOrZero(chunk.usage.completion_tokens);
-      }
-      const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
-      const choice = isRecord(choices[0]) ? choices[0] : null;
-      if (choice === null) continue;
-      const delta = isRecord(choice.delta) ? choice.delta : {};
-      out.push(...startEvents());
-      if (typeof delta.content === 'string' && delta.content !== '') {
-        if (textIndex === -1) {
-          textIndex = nextIndex;
-          nextIndex += 1;
-          out.push(sseEvent('content_block_start', { type: 'content_block_start', index: textIndex, content_block: { type: 'text', text: '' } }));
-        }
-        out.push(sseEvent('content_block_delta', { type: 'content_block_delta', index: textIndex, delta: { type: 'text_delta', text: delta.content } }));
-      }
-      const calls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
-      for (const call of calls) {
-        if (!isRecord(call)) continue;
-        const upstreamIndex = typeof call.index === 'number' ? call.index : toolIndexes.size;
-        let index = toolIndexes.get(upstreamIndex);
-        if (index === undefined) {
-          if (textIndex !== -1) {
-            out.push(sseEvent('content_block_stop', { type: 'content_block_stop', index: textIndex }));
-            textIndex = -1;
-          }
-          index = nextIndex;
-          nextIndex += 1;
-          toolIndexes.set(upstreamIndex, index);
-          const fn = isRecord(call.function) ? call.function : {};
-          out.push(
-            sseEvent('content_block_start', {
-              type: 'content_block_start',
-              index,
-              content_block: {
-                type: 'tool_use',
-                id: typeof call.id === 'string' && call.id !== '' ? call.id : `toolu_${index}`,
-                name: typeof fn.name === 'string' ? fn.name : '',
-                input: {},
-              },
-            }),
-          );
-        }
-        const fn = isRecord(call.function) ? call.function : {};
-        if (typeof fn.arguments === 'string' && fn.arguments !== '') {
-          out.push(sseEvent('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: fn.arguments } }));
-        }
-      }
-      // Hold the stop reason until the stream's last chunk (the usage one) and [DONE] have arrived: OpenAI
-      // sends the usage after the finish_reason, and Anthropic's message_delta carries the output tokens.
-      if (choice.finish_reason !== null && choice.finish_reason !== undefined) pendingStop = stopReasonOf(choice.finish_reason);
     }
-    return out;
-  };
+  }
+  return out;
+}
 
-  try {
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true }).replace(/\r\n/g, '\n');
-      let at = buffer.indexOf('\n\n');
-      while (at !== -1) {
-        const frame = buffer.slice(0, at);
-        buffer = buffer.slice(at + 2);
-        for (const event of eventsOfFrame(frame)) yield event;
-        at = buffer.indexOf('\n\n');
-      }
+/**
+ * Parse a streamed Chat Completions body into one answer. Content deltas join in order; tool-call
+ * deltas accumulate per index; the first finish_reason wins (a provider that repeats it, or carries
+ * it on the usage chunk, does not make a second finish); usage is the last one the stream carried.
+ */
+export function parseOpenAIStream(raw: string): UpstreamAnswer {
+  let text = '';
+  const toolCalls: ToolCall[] = [];
+  const byIndex = new Map<number, ToolCall>();
+  let finishReason: string | null = null;
+  let usage: UpstreamAnswer['usage'] = null;
+  let providerModel = '';
+  for (const chunk of ssePayloads(raw)) {
+    if (chunk === '[DONE]') continue;
+    if (typeof chunk.model === 'string' && chunk.model !== '' && providerModel === '') providerModel = chunk.model;
+    if (isRecord(chunk.usage)) {
+      usage = { prompt_tokens: numberOrZero(chunk.usage.prompt_tokens), completion_tokens: numberOrZero(chunk.usage.completion_tokens) };
     }
-    buffer += decoder.decode();
-    if (buffer.trim() !== '') for (const event of eventsOfFrame(buffer)) yield event;
-  } finally {
-    reader.releaseLock();
+    const choices = Array.isArray(chunk.choices) ? chunk.choices : [];
+    if (choices.length === 0) continue;
+    const choice = isRecord(choices[0]) ? choices[0] : null;
+    if (choice === null) continue;
+    const delta = isRecord(choice.delta) ? choice.delta : {};
+    if (typeof delta.content === 'string') text += delta.content;
+    const calls = Array.isArray(delta.tool_calls) ? delta.tool_calls : [];
+    for (const call of calls) {
+      if (!isRecord(call)) continue;
+      const upstreamIndex = typeof call.index === 'number' ? call.index : byIndex.size;
+      let entry = byIndex.get(upstreamIndex);
+      if (entry === undefined) {
+        entry = { id: '', name: '', arguments: '' };
+        byIndex.set(upstreamIndex, entry);
+        toolCalls.push(entry);
+      }
+      if (typeof call.id === 'string' && call.id !== '') entry.id = call.id;
+      const fn = isRecord(call.function) ? call.function : {};
+      if (typeof fn.name === 'string' && fn.name !== '') entry.name = fn.name;
+      if (typeof fn.arguments === 'string') entry.arguments += fn.arguments;
+    }
+    if (typeof choice.finish_reason === 'string' && finishReason === null) finishReason = choice.finish_reason;
   }
-  if (!finished) {
-    for (const event of startEvents()) yield event;
-    for (const event of finishEvents(pendingStop ?? 'end_turn')) yield event;
+  return { text, toolCalls, finishReason, usage, providerModel };
+}
+
+/** Parse a non-streamed Chat Completions body into one answer. */
+export function parseOpenAIJson(body: Json): UpstreamAnswer {
+  const choices = Array.isArray(body.choices) ? body.choices : [];
+  const choice = isRecord(choices[0]) ? choices[0] : {};
+  const message = isRecord(choice.message) ? choice.message : {};
+  const text = typeof message.content === 'string' ? message.content : textOf(message.content);
+  const toolCalls: ToolCall[] = [];
+  const calls = Array.isArray(message.tool_calls) ? message.tool_calls : [];
+  for (const call of calls) {
+    if (!isRecord(call) || !isRecord(call.function)) continue;
+    toolCalls.push({
+      id: typeof call.id === 'string' ? call.id : '',
+      name: typeof call.function.name === 'string' ? call.function.name : '',
+      arguments: typeof call.function.arguments === 'string' ? call.function.arguments : '',
+    });
   }
+  const usage = isRecord(body.usage)
+    ? { prompt_tokens: numberOrZero(body.usage.prompt_tokens), completion_tokens: numberOrZero(body.usage.completion_tokens) }
+    : null;
+  return {
+    text,
+    toolCalls,
+    finishReason: typeof choice.finish_reason === 'string' ? choice.finish_reason : null,
+    usage,
+    providerModel: typeof body.model === 'string' ? body.model : '',
+  };
+}
+
+/**
+ * One answer as canonical OpenAI SSE frames: the text as one content chunk (tool calls, when any,
+ * as one chunk carrying them), exactly one finish chunk, the usage on a chunk of its own, then
+ * [DONE]. `model` is the id the entry dialled, named back on every chunk.
+ */
+export function openAIStreamFrames(answer: UpstreamAnswer, model: string): string[] {
+  const id = 'chatcmpl-aggregate';
+  const frames: string[] = [];
+  const delta: Json = { role: 'assistant', content: answer.text };
+  if (answer.toolCalls.length > 0) {
+    delta.tool_calls = answer.toolCalls.map((call, index) => ({
+      index,
+      id: call.id !== '' ? call.id : `call_${index}`,
+      type: 'function',
+      function: { name: call.name, arguments: call.arguments },
+    }));
+  }
+  frames.push(
+    sseEvent(null, {
+      id,
+      object: 'chat.completion.chunk',
+      created: FIXED_OPENAI_CREATED,
+      model,
+      choices: [{ index: 0, delta, finish_reason: null }],
+    }),
+  );
+  frames.push(
+    sseEvent(null, {
+      id,
+      object: 'chat.completion.chunk',
+      created: FIXED_OPENAI_CREATED,
+      model,
+      choices: [{ index: 0, delta: {}, finish_reason: typeof answer.finishReason === 'string' ? answer.finishReason : 'stop' }],
+    }),
+  );
+  if (answer.usage !== null) {
+    frames.push(
+      sseEvent(null, {
+        id,
+        object: 'chat.completion.chunk',
+        created: FIXED_OPENAI_CREATED,
+        model,
+        choices: [],
+        usage: {
+          prompt_tokens: answer.usage.prompt_tokens,
+          completion_tokens: answer.usage.completion_tokens,
+          total_tokens: answer.usage.prompt_tokens + answer.usage.completion_tokens,
+        },
+      }),
+    );
+  }
+  frames.push('data: [DONE]\n\n');
+  return frames;
+}
+
+/**
+ * One answer as the Anthropic event sequence: message_start, one text block (then one tool_use
+ * block per tool call, with its input as a single input_json_delta), message_delta carrying the stop
+ * reason and the output tokens, then message_stop. `model` is the id the entry dialled.
+ */
+export function anthropicStreamEvents(answer: UpstreamAnswer, model: string): string[] {
+  const events: string[] = [];
+  const outputTokens = answer.usage === null ? 0 : answer.usage.completion_tokens;
+  const inputTokens = answer.usage === null ? 0 : answer.usage.prompt_tokens;
+  events.push(
+    sseEvent('message_start', {
+      type: 'message_start',
+      message: {
+        id: 'msg_aggregate',
+        type: 'message',
+        role: 'assistant',
+        model,
+        content: [],
+        stop_reason: null,
+        stop_sequence: null,
+        usage: { input_tokens: inputTokens, output_tokens: 0 },
+      },
+    }),
+  );
+  let index = 0;
+  if (answer.text !== '') {
+    events.push(sseEvent('content_block_start', { type: 'content_block_start', index, content_block: { type: 'text', text: '' } }));
+    events.push(sseEvent('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'text_delta', text: answer.text } }));
+    events.push(sseEvent('content_block_stop', { type: 'content_block_stop', index }));
+    index += 1;
+  }
+  for (const call of answer.toolCalls) {
+    events.push(
+      sseEvent('content_block_start', {
+        type: 'content_block_start',
+        index,
+        content_block: { type: 'tool_use', id: call.id !== '' ? call.id : `toolu_${index}`, name: call.name, input: {} },
+      }),
+    );
+    if (call.arguments !== '') {
+      events.push(
+        sseEvent('content_block_delta', { type: 'content_block_delta', index, delta: { type: 'input_json_delta', partial_json: call.arguments } }),
+      );
+    }
+    events.push(sseEvent('content_block_stop', { type: 'content_block_stop', index }));
+    index += 1;
+  }
+  events.push(
+    sseEvent('message_delta', {
+      type: 'message_delta',
+      delta: { stop_reason: stopReasonOf(answer.finishReason), stop_sequence: null },
+      usage: { output_tokens: outputTokens },
+    }),
+  );
+  events.push(sseEvent('message_stop', { type: 'message_stop' }));
+  return events;
 }
