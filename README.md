@@ -1,5 +1,11 @@
 # Free-Model Aggregator
 
+[![make.fun · free-model-aggregator-02](https://make.fun/badge/free-model-aggregator-02.svg)](https://make.fun/bounty/free-model-aggregator-02?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02)
+[![rank](https://make.fun/badge/free-model-aggregator-02/Arisaf7/free-model-aggregator-02-entry/rank.svg)](https://make.fun/bounty/free-model-aggregator-02/leaderboard?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02)
+[![reward](https://make.fun/badge/free-model-aggregator-02/Arisaf7/free-model-aggregator-02-entry/reward.svg)](https://make.fun/bounty/free-model-aggregator-02?utm_source=github&utm_medium=readme&utm_campaign=free-model-aggregator-02)
+
+Built for the make.fun bounty [The best live free-model aggregator](https://make.fun/bounty/free-model-aggregator-02) ($500 in USDC).
+
 One server that speaks both the OpenAI and Anthropic wires, and answers every
 completion with a real call to a free OpenRouter model, dialled through the
 grader's gateway. Built for the make.fun `free-model-aggregator-02` bounty.
