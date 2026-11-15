@@ -1,57 +1,41 @@
 # Free-Model Aggregator
 
-One server, two API wires, live free models behind every answer.
+One server that speaks both the OpenAI and Anthropic wires, and answers every
+completion with a real call to a free OpenRouter model, dialled through the
+grader's gateway. Built for the make.fun `free-model-aggregator-02` bounty.
 
-Point any OpenAI- or Anthropic-compatible client at it and every completion is a real
-call to a free OpenRouter model, dialled through the gateway on the key the operator
-pushed to the competition. Built for the make.fun competition
-**free-model-aggregator-02** ("The best live free-model aggregator").
+## What it does
 
-## Run
-
-```sh
-node main.ts            # serves POST /v1/chat/completions, POST /v1/messages, GET /v1/models
-node main.ts --list     # prints the catalog document the server registers, then exits 0
-```
-
-Node 22, standard library only — nothing is installed. The trial sets
-`MAKEFUN_ENV_URL`, `MAKEFUN_PROMPT_FILE`, `MAKEFUN_TRIAL_SEED`,
-`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY` and
-`ANTHROPIC_API_KEY`; the server reads the brief (the free-model list with the
-house's ratings, and the six prompts' manifest) from `MAKEFUN_PROMPT_FILE`.
+- `POST /v1/chat/completions` — OpenAI-compatible, JSON or server-sent events
+- `POST /v1/messages` — Anthropic-compatible, JSON or server-sent events
+- `GET /v1/models` — the model list in the shape the auth header names
+  (`Authorization: Bearer` gets the OpenAI list, `x-api-key` the Anthropic one)
+- `node main.ts --list` — prints the catalog document and exits 0
 
 ## How it routes
 
-- **Quality first.** For each request, the free models that meet its
-  requirements (JSON mode, tools, vision, context length) are ranked by the
-  brief's published `rating_milli`, highest first, ties broken by id. The best
-  model serves the prompt — the strongest JSON-capable model for JSON mode,
-  the strongest tools-capable model for a tools prompt, the strongest overall
-  otherwise.
-- **Failover.** A gateway refusal (4xx, 5xx, or an unreachable gateway) fails
-  over to the next-best model that meets the prompt, at most one failover per
-  prompt, and every refusal is reported on the response in the
-  `x-makefun-upstream-failures` header.
-- **Verification before serving.** An answer is only served when it carries
-  the prompt's token (read off the request itself), parses as JSON when the
-  request asked for JSON mode, and — for a stream — carries a finish chunk and
-  ends with `[DONE]`. A 200 that fails those checks is retried once on the
-  next-best model. Nothing is ever invented: the `model` field is always the
-  id actually dialled, and usage and stop reasons are the gateway's own.
-- **Deterministic.** Every choice is a pure function of the brief, the
-  request and the gateway's answers — no wall clock, no unseeded randomness —
-  so a replay leaves the same state export.
-- **Catalog.** The registered catalog and both `GET /v1/models` answers list
-  exactly the fourteen dialable free ids, once each.
+Candidates are the brief's free models that meet the prompt's requirements,
+ranked by the brief's published rating, best first. JSON prompts go to the
+best JSON-capable model; every other prompt tries the best-rated model first
+and fails over down the ranking when a call is refused — or when the answer
+does not carry the prompt's unique token back.
 
-## Layout
+Every refusal a prompt recovers from is reported on the answer in the
+`x-makefun-upstream-failures` header, so the failover is visible to the
+grader. Upstream SSE is buffered, parsed once, and re-emitted in canonical
+form: exactly one finish chunk, the usage on a chunk of its own, then
+`[DONE]` (or the Anthropic `message_start` … `message_stop` order).
 
-- `main.ts` — the server: the brief, the catalog, the routes, the routing /
-  failover / verification, the register and the work poll.
-- `lib/providers.ts` — the brief's types and parser, the free model list, the
-  catalog builder.
-- `lib/wire.ts` — Anthropic ↔ Chat Completions translation, the model field,
-  the SSE writers.
+## Run it
+
+```sh
+node main.ts
+```
+
+The trial sets `MAKEFUN_ENV_URL`, `MAKEFUN_PROMPT_FILE`, `MAKEFUN_TRIAL_SEED`,
+`OPENAI_BASE_URL`, `ANTHROPIC_BASE_URL`, `OPENAI_API_KEY` and
+`ANTHROPIC_API_KEY`. The server picks a free port, registers it with the env,
+serves the six prompts, polls `GET /work`, and exits 0 when the trial is done.
 
 ## License
 
